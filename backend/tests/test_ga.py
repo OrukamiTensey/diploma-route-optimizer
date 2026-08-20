@@ -516,3 +516,89 @@ class TestGeneticOptimizerOptimize:
         assert len(result.best_route) == 1
         assert result.best_route[0].id == "only"
         assert result.total_time > 0.0
+
+
+# =====================================================================
+# Інтеграція з 2-opt локальним пошуком
+# =====================================================================
+
+
+class TestGAWithLocalSearch:
+    """Інтеграційні тести меметичного GA (GA + 2-opt)."""
+
+    def test_local_search_improves_or_equals(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """GA з 2-opt показує кращу або рівну збіжність порівняно з базовим GA."""
+        opt_base = GeneticOptimizer(
+            request_4,
+            generations=30,
+            pop_size=40,
+            mutation_rate=0.15,
+            enable_local_search=False,
+            seed=42,
+        )
+        opt_memetic = GeneticOptimizer(
+            request_4,
+            generations=30,
+            pop_size=40,
+            mutation_rate=0.15,
+            enable_local_search=True,
+            local_search_fraction=0.10,
+            seed=42,
+        )
+
+        result_base = opt_base.optimize()
+        result_memetic = opt_memetic.optimize()
+
+        assert result_memetic.cost <= result_base.cost + 1e-9, (
+            f"Меметичний GA ({result_memetic.cost:.4f}) гірший за "
+            f"базовий GA ({result_base.cost:.4f})"
+        )
+
+    def test_local_search_preserves_all_tasks(
+        self, request_4: OptimizationRequest, tasks_4: List[Task]
+    ) -> None:
+        """GA з 2-opt зберігає всі задачі у результаті."""
+        opt = GeneticOptimizer(
+            request_4,
+            generations=10,
+            pop_size=20,
+            enable_local_search=True,
+            seed=42,
+        )
+        result = opt.optimize()
+        result_ids = {t.id for t in result.best_route}
+        expected_ids = {t.id for t in tasks_4}
+        assert result_ids == expected_ids
+
+    def test_local_search_convergence_monotonic(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """Збіжність GA з 2-opt монотонна (елітизм + 2-opt не погіршують)."""
+        opt = GeneticOptimizer(
+            request_4,
+            generations=20,
+            pop_size=30,
+            enable_local_search=True,
+            seed=42,
+        )
+        result = opt.optimize()
+        for i in range(1, len(result.convergence_history)):
+            assert result.convergence_history[i] <= result.convergence_history[i - 1] + 1e-9
+
+    def test_disable_local_search_flag(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """enable_local_search=False вимикає 2-opt, GA працює як раніше."""
+        opt = GeneticOptimizer(
+            request_4,
+            generations=5,
+            pop_size=10,
+            enable_local_search=False,
+            seed=42,
+        )
+        result = opt.optimize()
+        assert isinstance(result, OptimizationResult)
+        assert result.cost > 0.0
+

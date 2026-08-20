@@ -8,6 +8,7 @@
   3. Багатофакторна фітнес-функція:
        F(Route) = w₁·T_total + w₂·Σmax(0, aᵢ - lᵢ) + w₃·Σp_j(unvisited)
   4. Турнірна селекція (k=3), OX-кросовер, swap/inversion мутація, елітизм.
+  5. Локальне покращення: 2-opt евристика для топ-10% особин (меметичний GA).
 
 Відповідає специфікації: docs/specs/ALGORITHMS_SPEC.md
 """
@@ -20,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from app.core.local_search import apply_2opt
 from app.core.traffic import TrafficMatrixGenerator
 from app.schemas.models import Location, OptimizationRequest, Task
 
@@ -233,6 +235,12 @@ class GeneticOptimizer:
         Розмір турніру для селекції.
     elite_fraction : float
         Частка елітних особин, що переходять без змін (0.0–1.0).
+    enable_local_search : bool
+        Увімкнути 2-opt локальний пошук для топ-особин (меметичний GA).
+    local_search_fraction : float
+        Частка найкращих особин, до яких застосовується 2-opt (0.0–1.0).
+    local_search_max_iter : int
+        Максимальна кількість ітерацій 2-opt на одну хромосому.
     seed : Optional[int]
         Зерно для відтворюваності результатів.
     """
@@ -246,6 +254,9 @@ class GeneticOptimizer:
         mutation_rate: float = 0.15,
         tournament_size: int = 3,
         elite_fraction: float = 0.05,
+        enable_local_search: bool = True,
+        local_search_fraction: float = 0.10,
+        local_search_max_iter: int = 50,
         seed: Optional[int] = None,
     ) -> None:
         self._depot: Location = request.depot
@@ -260,6 +271,9 @@ class GeneticOptimizer:
         self._mutation_rate: float = mutation_rate
         self._tournament_size: int = tournament_size
         self._elite_count: int = max(1, int(pop_size * elite_fraction))
+        self._enable_local_search: bool = enable_local_search
+        self._ls_count: int = max(1, int(pop_size * local_search_fraction))
+        self._ls_max_iter: int = local_search_max_iter
         self._rng: random.Random = random.Random(seed)
 
         # Генератор трафіку
@@ -325,6 +339,10 @@ class GeneticOptimizer:
 
             population = next_population
             fitness_values = [self._evaluate(ch) for ch in population]
+
+            # 5. Локальний пошук 2-opt для топ-N% особин
+            if self._enable_local_search and self._n >= 2:
+                self._apply_local_search(population, fitness_values)
 
         # Фінальний запис
         convergence.append(min(fitness_values))
@@ -468,6 +486,29 @@ class GeneticOptimizer:
         )
 
         return w1 * sim.total_time + w2 * sim.total_lateness + w3 * unvisited_priority
+
+    def _apply_local_search(
+        self,
+        population: List[Chromosome],
+        fitness_values: List[float],
+    ) -> None:
+        """Застосовує 2-opt до топ-N% особин популяції (in-place).
+
+        Вибирає ``_ls_count`` найкращих хромосом, покращує їх через
+        ``apply_2opt`` і оновлює популяцію та масив фітнесу на місці.
+        """
+        top_indices = sorted(
+            range(len(population)), key=lambda i: fitness_values[i]
+        )[: self._ls_count]
+
+        for idx in top_indices:
+            improved_ch, improved_cost = apply_2opt(
+                population[idx],
+                self._evaluate,
+                max_iterations=self._ls_max_iter,
+            )
+            population[idx] = improved_ch
+            fitness_values[idx] = improved_cost
 
     def _init_population(self) -> List[Chromosome]:
         """Генерує початкову популяцію випадкових перестановок."""
