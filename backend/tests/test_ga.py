@@ -19,6 +19,7 @@ import pytest
 
 from app.core.ga import (
     DEFAULT_WEIGHTS,
+    AdaptiveMutationController,
     Chromosome,
     GeneticOptimizer,
     OptimizationResult,
@@ -602,3 +603,324 @@ class TestGAWithLocalSearch:
         assert isinstance(result, OptimizationResult)
         assert result.cost > 0.0
 
+# =====================================================================
+# Адаптивний контролер мутацій: unit-тести
+# =====================================================================
+
+
+class TestAdaptiveMutationController:
+    """Тести AdaptiveMutationController ізольовано від GA."""
+
+    def test_stagnation_increases_pm(self) -> None:
+        """Симуляція стагнації (10 поколінь без покращення) → P_m зростає."""
+        ctrl = AdaptiveMutationController(
+            initial_pm=0.10,
+            p_min=0.05,
+            p_max=0.20,
+            stagnation_threshold=5,
+            increase_step=0.02,
+            decrease_step=0.01,
+        )
+        initial_pm = ctrl.current_pm
+
+        # 10 поколінь з однаковим best_cost — стагнація
+        for _ in range(10):
+            ctrl.update(best_cost=100.0, fitness_values=[100.0, 101.0, 102.0])
+
+        assert ctrl.current_pm > initial_pm, (
+            f"P_m має зрости при стагнації: "
+            f"initial={initial_pm}, current={ctrl.current_pm}"
+        )
+        assert ctrl.stagnation_counter >= 5
+
+    def test_improvement_decreases_pm(self) -> None:
+        """Послідовні покращення best fitness → P_m знижується."""
+        ctrl = AdaptiveMutationController(
+            initial_pm=0.18,
+            p_min=0.05,
+            p_max=0.20,
+            decrease_step=0.01,
+        )
+        initial_pm = ctrl.current_pm
+
+        # Послідовні покращення
+        for cost in [100.0, 95.0, 90.0, 85.0, 80.0]:
+            ctrl.update(best_cost=cost, fitness_values=[cost, cost + 5, cost + 10])
+
+        assert ctrl.current_pm < initial_pm, (
+            f"P_m має знизитись при покращеннях: "
+            f"initial={initial_pm}, current={ctrl.current_pm}"
+        )
+        assert ctrl.stagnation_counter == 0
+
+    def test_pm_never_exceeds_bounds(self) -> None:
+        """P_m ніколи не виходить за межі [p_min, p_max] за 1000 ітерацій."""
+        random.seed(999)
+        ctrl = AdaptiveMutationController(
+            initial_pm=0.10,
+            p_min=0.05,
+            p_max=0.20,
+            stagnation_threshold=3,
+            increase_step=0.05,  # агресивний крок
+            decrease_step=0.03,
+        )
+
+        best = 100.0
+        for _ in range(1000):
+            # Випадково: або покращення, або стагнація
+            if random.random() < 0.3:
+                best -= random.uniform(0.1, 5.0)
+            fitness = [best + random.uniform(0, 20) for _ in range(30)]
+            ctrl.update(best_cost=best, fitness_values=fitness)
+            assert 0.05 <= ctrl.current_pm <= 0.20, (
+                f"P_m вийшов за межі: {ctrl.current_pm}"
+            )
+
+        # Перевіряємо і всю історію
+        for pm_val in ctrl.history:
+            assert 0.05 <= pm_val <= 0.20
+
+    def test_low_diversity_increases_pm(self) -> None:
+        """Однакові fitness-значення (diversity < threshold) → P_m зростає."""
+        ctrl = AdaptiveMutationController(
+            initial_pm=0.10,
+            p_min=0.05,
+            p_max=0.20,
+            diversity_threshold=0.01,
+            stagnation_threshold=100,  # вимикаємо стагнацію
+            increase_step=0.03,
+        )
+
+        # Перше покращення щоб скинути initial inf
+        ctrl.update(best_cost=50.0, fitness_values=[50.0, 50.0, 50.0])
+        pm_after_first = ctrl.current_pm
+
+        # Повністю однакові fitness → diversity ≈ 0 → має зрости
+        for _ in range(5):
+            ctrl.update(best_cost=50.0, fitness_values=[50.0, 50.0, 50.0])
+
+        assert ctrl.current_pm > pm_after_first, (
+            f"P_m має зрости при низькій різноманітності: "
+            f"after_first={pm_after_first}, current={ctrl.current_pm}"
+        )
+
+    def test_history_length_matches_updates(self) -> None:
+        """Довжина history == кількість викликів update()."""
+        ctrl = AdaptiveMutationController(initial_pm=0.10)
+
+        n_updates = 25
+        for i in range(n_updates):
+            ctrl.update(best_cost=100.0 - i, fitness_values=[100.0, 105.0])
+
+        assert len(ctrl.history) == n_updates
+
+    def test_initial_pm_clamped(self) -> None:
+        """initial_pm за межами [p_min, p_max] обрізається."""
+        ctrl_low = AdaptiveMutationController(initial_pm=0.01, p_min=0.05, p_max=0.20)
+        assert ctrl_low.current_pm == 0.05
+
+        ctrl_high = AdaptiveMutationController(initial_pm=0.50, p_min=0.05, p_max=0.20)
+        assert ctrl_high.current_pm == 0.20
+
+
+# =====================================================================
+# Індивідуальна мутація Srinivas: unit-тести
+# =====================================================================
+
+
+class TestSrinivasIndividualPm:
+    """Тести get_individual_pm() — Srinivas-адаптивна мутація."""
+
+    def test_worst_individual_gets_p_max(self) -> None:
+        """Найгірша особина (max fitness) → P_m = p_max."""
+        ctrl = AdaptiveMutationController(initial_pm=0.10, p_min=0.05, p_max=0.20)
+        pm = ctrl.get_individual_pm(
+            individual_fitness=200.0, min_fitness=100.0, max_fitness=200.0
+        )
+        assert abs(pm - 0.20) < 1e-9
+
+    def test_best_individual_gets_p_min(self) -> None:
+        """Найкраща особина (min fitness) → P_m = p_min."""
+        ctrl = AdaptiveMutationController(initial_pm=0.10, p_min=0.05, p_max=0.20)
+        pm = ctrl.get_individual_pm(
+            individual_fitness=100.0, min_fitness=100.0, max_fitness=200.0
+        )
+        assert abs(pm - 0.05) < 1e-9
+
+    def test_median_individual_gets_midpoint(self) -> None:
+        """Особина з fitness посередині → P_m ≈ (p_min + p_max) / 2."""
+        ctrl = AdaptiveMutationController(initial_pm=0.10, p_min=0.05, p_max=0.20)
+        pm = ctrl.get_individual_pm(
+            individual_fitness=150.0, min_fitness=100.0, max_fitness=200.0
+        )
+        expected = (0.05 + 0.20) / 2.0
+        assert abs(pm - expected) < 1e-9
+
+    def test_uniform_population_returns_midpoint(self) -> None:
+        """Однакові min == max fitness → повертає (p_min + p_max) / 2."""
+        ctrl = AdaptiveMutationController(initial_pm=0.10, p_min=0.05, p_max=0.20)
+        pm = ctrl.get_individual_pm(
+            individual_fitness=100.0, min_fitness=100.0, max_fitness=100.0
+        )
+        expected = (0.05 + 0.20) / 2.0
+        assert abs(pm - expected) < 1e-9
+
+    def test_individual_pm_always_in_bounds(self) -> None:
+        """Будь-яке значення individual_fitness → P_m ∈ [p_min, p_max]."""
+        ctrl = AdaptiveMutationController(initial_pm=0.10, p_min=0.05, p_max=0.20)
+        for f in [-100.0, 0.0, 50.0, 100.0, 150.0, 200.0, 500.0]:
+            pm = ctrl.get_individual_pm(
+                individual_fitness=f, min_fitness=100.0, max_fitness=200.0
+            )
+            assert 0.05 <= pm <= 0.20, f"PM out of bounds for fitness={f}: {pm}"
+
+
+# =====================================================================
+# Адаптивна мутація: інтеграційні тести з GA
+# =====================================================================
+
+
+class TestAdaptiveMutationIntegration:
+    """Інтеграційні тести адаптивної мутації в повному циклі GA."""
+
+    def test_mutation_rate_history_length(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """mutation_rate_history має generations записів після optimize()."""
+        gens = 15
+        opt = GeneticOptimizer(
+            request_4,
+            generations=gens,
+            pop_size=20,
+            adaptive_mutation=True,
+            seed=42,
+        )
+        result = opt.optimize()
+        assert len(result.mutation_rate_history) == gens
+
+    def test_mutation_rate_history_values_in_bounds(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """Всі значення в mutation_rate_history ∈ [0.05, 0.20]."""
+        opt = GeneticOptimizer(
+            request_4,
+            generations=30,
+            pop_size=40,
+            adaptive_mutation=True,
+            pm_min=0.05,
+            pm_max=0.20,
+            seed=42,
+        )
+        result = opt.optimize()
+        for i, pm_val in enumerate(result.mutation_rate_history):
+            assert 0.05 <= pm_val <= 0.20, (
+                f"Покоління {i}: P_m={pm_val} поза межами [0.05, 0.20]"
+            )
+
+    def test_mutation_rate_history_contains_floats(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """mutation_rate_history містить float значення."""
+        opt = GeneticOptimizer(
+            request_4,
+            generations=5,
+            pop_size=10,
+            adaptive_mutation=True,
+            seed=42,
+        )
+        result = opt.optimize()
+        assert len(result.mutation_rate_history) > 0
+        for val in result.mutation_rate_history:
+            assert isinstance(val, float)
+
+    def test_adaptive_disabled_fixed_rate(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """adaptive_mutation=False → фіксований rate, history повторює mutation_rate."""
+        gens = 10
+        fixed_rate = 0.12
+        opt = GeneticOptimizer(
+            request_4,
+            generations=gens,
+            pop_size=20,
+            mutation_rate=fixed_rate,
+            adaptive_mutation=False,
+            seed=42,
+        )
+        result = opt.optimize()
+        assert len(result.mutation_rate_history) == gens
+        for pm_val in result.mutation_rate_history:
+            assert pm_val == fixed_rate
+
+    def test_adaptive_ga_still_converges(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """GA з адаптивною мутацією збігається (last cost ≤ first cost)."""
+        opt = GeneticOptimizer(
+            request_4,
+            generations=50,
+            pop_size=40,
+            adaptive_mutation=True,
+            seed=42,
+        )
+        result = opt.optimize()
+        first = result.convergence_history[0]
+        last = result.convergence_history[-1]
+        assert last <= first, (
+            f"GA з адаптивною мутацією не збігся: last={last:.4f} > first={first:.4f}"
+        )
+
+    def test_adaptive_ga_preserves_all_tasks(
+        self, request_4: OptimizationRequest, tasks_4: List[Task]
+    ) -> None:
+        """GA з адаптивною мутацією зберігає всі задачі."""
+        opt = GeneticOptimizer(
+            request_4,
+            generations=10,
+            pop_size=20,
+            adaptive_mutation=True,
+            seed=42,
+        )
+        result = opt.optimize()
+        result_ids = {t.id for t in result.best_route}
+        expected_ids = {t.id for t in tasks_4}
+        assert result_ids == expected_ids
+
+    def test_backward_compatibility_result_structure(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """OptimizationResult має поле mutation_rate_history для обох режимів."""
+        # Adaptive ON
+        opt_on = GeneticOptimizer(
+            request_4, generations=5, pop_size=10, adaptive_mutation=True, seed=42
+        )
+        result_on = opt_on.optimize()
+        assert hasattr(result_on, "mutation_rate_history")
+        assert isinstance(result_on.mutation_rate_history, list)
+
+        # Adaptive OFF
+        opt_off = GeneticOptimizer(
+            request_4, generations=5, pop_size=10, adaptive_mutation=False, seed=42
+        )
+        result_off = opt_off.optimize()
+        assert hasattr(result_off, "mutation_rate_history")
+        assert isinstance(result_off.mutation_rate_history, list)
+
+    def test_convergence_monotonic_with_adaptive(
+        self, request_4: OptimizationRequest
+    ) -> None:
+        """Збіжність GA з адаптивною мутацією монотонна (елітизм зберігається)."""
+        opt = GeneticOptimizer(
+            request_4,
+            generations=30,
+            pop_size=40,
+            adaptive_mutation=True,
+            elite_fraction=0.05,
+            seed=42,
+        )
+        result = opt.optimize()
+        for i in range(1, len(result.convergence_history)):
+            assert result.convergence_history[i] <= result.convergence_history[i - 1] + 1e-9, (
+                f"Покоління {i}: {result.convergence_history[i]:.4f} > "
+                f"{result.convergence_history[i-1]:.4f} (регресія при адаптивній мутації)"
+            )

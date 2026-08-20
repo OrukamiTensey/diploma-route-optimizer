@@ -8,7 +8,9 @@
   3. Багатофакторна фітнес-функція:
        F(Route) = w₁·T_total + w₂·Σmax(0, aᵢ - lᵢ) + w₃·Σp_j(unvisited)
   4. Турнірна селекція (k=3), OX-кросовер, swap/inversion мутація, елітизм.
-  5. Локальне покращення: 2-opt евристика для топ-10% особин (меметичний GA).
+  5. Адаптивна ймовірність мутації P_m ∈ [0.05, 0.2] з відстеженням
+     стагнації та різноманітності популяції + Srinivas-адаптація на рівні особин.
+  6. Локальне покращення: 2-opt евристика для топ-10% особин (меметичний GA).
 
 Відповідає специфікації: docs/specs/ALGORITHMS_SPEC.md
 """
@@ -61,6 +63,173 @@ class RouteSimulation:
 
 
 # ---------------------------------------------------------------------------
+# Адаптивний контролер мутацій
+# ---------------------------------------------------------------------------
+
+
+class AdaptiveMutationController:
+    """Контролер адаптивної зміни ймовірності мутацій P_m ∈ [p_min, p_max].
+
+    Два тригери підвищення P_m (exploration):
+      1. ``stagnation_counter ≥ stagnation_threshold`` — немає покращення
+         найкращого fitness протягом N поколінь.
+      2. ``fitness_std / mean_fitness < diversity_threshold`` — популяція
+         втрачає різноманітність (конвергенція).
+
+    Покращення найкращого fitness → зниження P_m (exploitation).
+
+    Parameters
+    ----------
+    initial_pm : float
+        Початкове значення P_m (зазвичай mutation_rate з GeneticOptimizer).
+    p_min : float
+        Мінімальна ймовірність мутації.
+    p_max : float
+        Максимальна ймовірність мутації.
+    stagnation_threshold : int
+        Кількість поколінь без покращення, після якої P_m зростає.
+    diversity_threshold : float
+        Поріг коефіцієнта варіації (σ/μ) fitness, нижче якого P_m зростає.
+    increase_step : float
+        Крок збільшення P_m при стагнації / низькій різноманітності.
+    decrease_step : float
+        Крок зменшення P_m при покращенні найкращого fitness.
+    """
+
+    def __init__(
+        self,
+        initial_pm: float,
+        *,
+        p_min: float = 0.05,
+        p_max: float = 0.20,
+        stagnation_threshold: int = 5,
+        diversity_threshold: float = 0.01,
+        increase_step: float = 0.02,
+        decrease_step: float = 0.01,
+    ) -> None:
+        self._p_min = p_min
+        self._p_max = p_max
+        self._stagnation_threshold = stagnation_threshold
+        self._diversity_threshold = diversity_threshold
+        self._increase_step = increase_step
+        self._decrease_step = decrease_step
+
+        self._current_pm: float = max(p_min, min(p_max, initial_pm))
+        self._stagnation_counter: int = 0
+        self._best_fitness: float = float("inf")
+        self._history: List[float] = []
+
+    # -- properties ---------------------------------------------------------
+
+    @property
+    def current_pm(self) -> float:
+        """Поточне глобальне значення P_m."""
+        return self._current_pm
+
+    @property
+    def history(self) -> List[float]:
+        """Історія P_m по поколіннях (для побудови графіків)."""
+        return list(self._history)
+
+    @property
+    def stagnation_counter(self) -> int:
+        """Поточна кількість поколінь без покращення."""
+        return self._stagnation_counter
+
+    # -- основна логіка -----------------------------------------------------
+
+    def update(
+        self,
+        best_cost: float,
+        fitness_values: List[float],
+    ) -> float:
+        """Оновлює P_m на основі стану популяції поточного покоління.
+
+        Parameters
+        ----------
+        best_cost : float
+            Найкращий fitness (cost) поточного покоління.
+        fitness_values : List[float]
+            Fitness-значення всіх особин поточного покоління.
+
+        Returns
+        -------
+        float
+            Оновлене значення P_m.
+        """
+        eps = 1e-12
+
+        # --- Відстеження стагнації ---
+        if best_cost < self._best_fitness - eps:
+            # Покращення → exploitation
+            self._best_fitness = best_cost
+            self._stagnation_counter = 0
+            self._current_pm = max(
+                self._p_min, self._current_pm - self._decrease_step
+            )
+        else:
+            self._stagnation_counter += 1
+
+        # --- Різноманітність популяції (коефіцієнт варіації σ/μ) ---
+        arr = np.array(fitness_values, dtype=np.float64)
+        mean_f = float(np.mean(arr))
+        std_f = float(np.std(arr))
+        diversity = std_f / (abs(mean_f) + eps)
+
+        # --- Тригери exploration ---
+        if (
+            self._stagnation_counter >= self._stagnation_threshold
+            or diversity < self._diversity_threshold
+        ):
+            self._current_pm = min(
+                self._p_max, self._current_pm + self._increase_step
+            )
+
+        # --- Clamping (гарантія меж) ---
+        self._current_pm = max(self._p_min, min(self._p_max, self._current_pm))
+
+        self._history.append(self._current_pm)
+        return self._current_pm
+
+    def get_individual_pm(
+        self,
+        individual_fitness: float,
+        min_fitness: float,
+        max_fitness: float,
+    ) -> float:
+        """Обчислює індивідуальну P_m за адаптивною схемою Srinivas.
+
+        Лінійна інтерполяція: кращі особини (низький fitness) → P_min,
+        гірші (високий fitness) → P_max.
+
+        Parameters
+        ----------
+        individual_fitness : float
+            Fitness конкретної особини (або оцінка для нащадка).
+        min_fitness : float
+            Найкращий (мінімальний) fitness у поточній популяції.
+        max_fitness : float
+            Найгірший (максимальний) fitness у поточній популяції.
+
+        Returns
+        -------
+        float
+            Індивідуальна P_m ∈ [p_min, p_max].
+        """
+        fitness_range = max_fitness - min_fitness
+        if fitness_range < 1e-12:
+            # Вся популяція однакова → середнє значення
+            return (self._p_min + self._p_max) / 2.0
+
+        # Нормалізоване відхилення від найкращого [0..1]
+        ratio = (individual_fitness - min_fitness) / fitness_range
+        ratio = max(0.0, min(1.0, ratio))  # clamp
+
+        pm = self._p_min + ratio * (self._p_max - self._p_min)
+        return max(self._p_min, min(self._p_max, pm))
+
+
+# ---------------------------------------------------------------------------
 # Результат оптимізації
 # ---------------------------------------------------------------------------
 
@@ -80,6 +249,8 @@ class OptimizationResult:
         Фінальне значення фітнес-функції F(Route).
     convergence_history : List[float]
         Значення найкращого cost по кожному поколінню.
+    mutation_rate_history : List[float]
+        Історія зміни P_m по поколіннях (для аналізу та побудови графіків).
     """
 
     best_route: List[Task]
@@ -87,6 +258,7 @@ class OptimizationResult:
     total_lateness: float
     cost: float
     convergence_history: List[float]
+    mutation_rate_history: List[float]
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +403,16 @@ class GeneticOptimizer:
         Розмір популяції.
     mutation_rate : float
         Базова ймовірність мутації P_m ∈ [0.05, 0.2].
+    adaptive_mutation : bool
+        Увімкнути адаптивну зміну P_m на основі стагнації / різноманітності.
+    pm_min : float
+        Мінімальна межа адаптивного P_m.
+    pm_max : float
+        Максимальна межа адаптивного P_m.
+    stagnation_threshold : int
+        Кількість поколінь без покращення для тригеру exploration.
+    diversity_threshold : float
+        Поріг коефіцієнта варіації (σ/μ) fitness нижче якого P_m зростає.
     tournament_size : int
         Розмір турніру для селекції.
     elite_fraction : float
@@ -252,6 +434,11 @@ class GeneticOptimizer:
         generations: int = 100,
         pop_size: int = 60,
         mutation_rate: float = 0.15,
+        adaptive_mutation: bool = True,
+        pm_min: float = 0.05,
+        pm_max: float = 0.20,
+        stagnation_threshold: int = 5,
+        diversity_threshold: float = 0.01,
         tournament_size: int = 3,
         elite_fraction: float = 0.05,
         enable_local_search: bool = True,
@@ -275,6 +462,20 @@ class GeneticOptimizer:
         self._ls_count: int = max(1, int(pop_size * local_search_fraction))
         self._ls_max_iter: int = local_search_max_iter
         self._rng: random.Random = random.Random(seed)
+
+        # Адаптивний контролер мутацій
+        if adaptive_mutation:
+            self._adaptive_controller: Optional[AdaptiveMutationController] = (
+                AdaptiveMutationController(
+                    initial_pm=mutation_rate,
+                    p_min=pm_min,
+                    p_max=pm_max,
+                    stagnation_threshold=stagnation_threshold,
+                    diversity_threshold=diversity_threshold,
+                )
+            )
+        else:
+            self._adaptive_controller = None
 
         # Генератор трафіку
         self._traffic: TrafficMatrixGenerator = TrafficMatrixGenerator()
@@ -307,7 +508,20 @@ class GeneticOptimizer:
             best_cost = min(fitness_values)
             convergence.append(best_cost)
 
-            # 3. Елітизм: відбираємо топ-k
+            # 3. Адаптивне оновлення P_m
+            if self._adaptive_controller is not None:
+                current_pm = self._adaptive_controller.update(
+                    best_cost, fitness_values
+                )
+                # Статистики для Srinivas-індивідуальної мутації
+                min_fitness = min(fitness_values)
+                max_fitness = max(fitness_values)
+            else:
+                current_pm = self._mutation_rate
+                min_fitness = 0.0
+                max_fitness = 0.0
+
+            # 4. Елітизм: відбираємо топ-k
             elite_indices = sorted(
                 range(len(population)), key=lambda i: fitness_values[i]
             )[: self._elite_count]
@@ -315,21 +529,38 @@ class GeneticOptimizer:
                 list(population[i]) for i in elite_indices
             ]
 
-            # 4. Генерація нового покоління
+            # 5. Генерація нового покоління
             while len(next_population) < self._pop_size:
                 # Селекція
-                parent_a = tournament_selection(
-                    population, fitness_values, self._tournament_size
+                parent_a_idx = self._tournament_select_idx(
+                    population, fitness_values
                 )
-                parent_b = tournament_selection(
-                    population, fitness_values, self._tournament_size
+                parent_b_idx = self._tournament_select_idx(
+                    population, fitness_values
                 )
+                parent_a = list(population[parent_a_idx])
+                parent_b = list(population[parent_b_idx])
 
                 # Кросовер
                 child = order_crossover(parent_a, parent_b)
 
+                # Ймовірність мутації (індивідуальна або глобальна)
+                if self._adaptive_controller is not None:
+                    # Оцінюємо fitness нащадка як середнє батьків (Srinivas)
+                    estimated_child_fitness = (
+                        fitness_values[parent_a_idx]
+                        + fitness_values[parent_b_idx]
+                    ) / 2.0
+                    child_pm = self._adaptive_controller.get_individual_pm(
+                        individual_fitness=estimated_child_fitness,
+                        min_fitness=min_fitness,
+                        max_fitness=max_fitness,
+                    )
+                else:
+                    child_pm = current_pm
+
                 # Мутація
-                if random.random() < self._mutation_rate:
+                if random.random() < child_pm:
                     if random.random() < 0.5:
                         child = swap_mutation(child)
                     else:
@@ -340,7 +571,7 @@ class GeneticOptimizer:
             population = next_population
             fitness_values = [self._evaluate(ch) for ch in population]
 
-            # 5. Локальний пошук 2-opt для топ-N% особин
+            # 6. Локальний пошук 2-opt для топ-N% особин
             if self._enable_local_search and self._n >= 2:
                 self._apply_local_search(population, fitness_values)
 
@@ -352,12 +583,19 @@ class GeneticOptimizer:
         best_chromosome = population[best_idx]
         best_sim = self._simulate(best_chromosome)
 
+        # Історія P_m
+        if self._adaptive_controller is not None:
+            pm_history = self._adaptive_controller.history
+        else:
+            pm_history = [self._mutation_rate] * self._generations
+
         return OptimizationResult(
             best_route=[self._tasks[i] for i in best_chromosome],
             total_time=best_sim.total_time,
             total_lateness=best_sim.total_lateness,
             cost=fitness_values[best_idx],
             convergence_history=convergence,
+            mutation_rate_history=pm_history,
         )
 
     # -- симуляція маршруту -------------------------------------------------
@@ -509,6 +747,23 @@ class GeneticOptimizer:
             )
             population[idx] = improved_ch
             fitness_values[idx] = improved_cost
+
+    def _tournament_select_idx(
+        self,
+        population: List[Chromosome],
+        fitness_values: List[float],
+    ) -> int:
+        """Турнірна селекція — повертає *індекс* переможця.
+
+        Аналогічна ``tournament_selection()``, але повертає індекс у
+        популяції для подальшого доступу до fitness батька (потрібен
+        для Srinivas-адаптивної мутації нащадка).
+        """
+        indices = random.sample(
+            range(len(population)),
+            min(self._tournament_size, len(population)),
+        )
+        return min(indices, key=lambda i: fitness_values[i])
 
     def _init_population(self) -> List[Chromosome]:
         """Генерує початкову популяцію випадкових перестановок."""
