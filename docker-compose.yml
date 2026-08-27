@@ -1,0 +1,30 @@
+# ===========================================================================
+# Docker Compose для TD-VRPTW Optimization API
+#
+# Запуск:  docker compose up --build
+# Зупинка: docker compose down
+# ===========================================================================
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: td-vrptw-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Монтування коду для швидкої розробки (hot-reload)
+      - ./backend:/app/backend
+      # Монтування документації для збереження графіків
+      - ./docs:/app/docs
+    environment:
+      - PYTHONPATH=/app/backend
+      - GEO_PROVIDER=synthetic
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-dir /app/backend
+    restart: unless-stopped
